@@ -111,36 +111,45 @@ pub async fn main() {
         .await;
 
     let mut sub = sub.unwrap();
+
+    // Wait for new justification
     while let Some(Ok(justification)) = sub.next().await {
         println!("Justification: {justification:?}");
+
+        // get the header corresponding to the new justification
         let header = c
             .rpc()
             .header(Some(justification.commit.target_hash))
             .await
             .unwrap()
             .unwrap();
+        // a bit redundant, but just to make sure the hash is correct
         let calculated_hash: H256 = Encode::using_encoded(&header, blake2_256).into();
         assert_eq!(justification.commit.target_hash, calculated_hash);
+        // get current authority set ID
         let set_id_key = api::storage().grandpa().current_set_id();
         let set_id = c.storage().fetch(&set_id_key, None).await.unwrap().unwrap();
         println!("Current set id: {set_id:?}");
 
+        // Form a message which is signed in the justification
         let signed_message = Encode::encode(&(
             &SignerMessage::PrecommitMessage(justification.commit.precommits[0].clone().precommit),
             &justification.round,
             &set_id,
         ));
-        // let p: ed25519::Public = auths[0].0;
+        // Extract the public key of the signed message
         let p: EdPublic = justification.commit.precommits[0].clone().id;
+
+        // Verify signature
         let is_ok = <ed25519::Pair as Pair>::verify_weak(
             &justification.commit.precommits[0].clone().signature.0[..],
             signed_message.as_slice(),
             p,
         );
         assert!(is_ok, "Not signed by this signature!");
-        let p = p.0;
         println!("Justification AccountId: {p:?}");
 
+        // Get the current authority set
         let authority_set_key = api::storage().authority_discovery().keys();
         let authority_set = c
             .storage()
@@ -148,7 +157,8 @@ pub async fn main() {
             .await
             .unwrap()
             .unwrap();
-        let a: SrPublic = authority_set.0[0].clone().0;
+        let a: Vec<SrPublic> = authority_set.0.into_iter().map(|e|e.0).collect();
         println!("Current authority set: {a:?}");
+        // Authority set is sr25519 key, justification is ed25519.
     }
 }
