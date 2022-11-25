@@ -15,4 +15,5 @@ serde = {version = "1", features= ["derive"]}
 codec = { package = "parity-scale-codec", version = "3.0.0", default-features = false, features = ["derive", "full", "bit-vec"] }
 sp-core = "6.0.0"
 avail-subxt = {path = "../avail/avail-subxt"}
+subxt = "0.24"
 hex = "0.4.3"

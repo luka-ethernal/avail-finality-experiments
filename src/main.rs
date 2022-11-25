@@ -1,29 +1,18 @@
+use std::ops::Deref;
+
+use avail_subxt::api::runtime_types::sp_core::sr25519::Public as SrPublic;
 use avail_subxt::{api, build_client, primitives::Header};
-use codec::{Compact, Decode, Encode};
-use futures_util::{SinkExt, StreamExt};
+use codec::{Decode, Encode};
+use futures_util::StreamExt;
+use serde::de::Error;
 use serde::Deserialize;
 use sp_core::{
-    blake2_128, blake2_256,
+    blake2_256, bytes,
     crypto::Pair,
-    ed25519::{self, Public, Signature},
-    hashing::blake2_512,
-    twox_128, Bytes, H256,
+    ed25519::{self, Public as EdPublic, Signature},
+    H256,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-#[derive(Deserialize, Debug)]
-struct SubscriptionResponse {
-    jsonrpc: String,
-    result: String,
-    id: i32,
-}
-
-#[derive(Deserialize, Debug)]
-struct HeaderResponse {
-    jsonrpc: String,
-    result: Header,
-    id: i32,
-}
+use subxt::rpc::RpcParams;
 
 #[derive(Deserialize, Debug)]
 pub struct SubscriptionMessageResult {
@@ -38,22 +27,22 @@ pub struct SubscriptionMessage {
     pub method: String,
 }
 
-#[derive(Clone, Debug, Decode, Encode)]
+#[derive(Clone, Debug, Decode, Encode, Deserialize)]
 pub struct Precommit {
     pub target_hash: H256,
     /// The target block's number
     pub target_number: u32,
 }
 
-#[derive(Clone, Debug, Decode)]
+#[derive(Clone, Debug, Decode, Deserialize)]
 pub struct SignedPrecommit {
     pub precommit: Precommit,
     /// The signature on the message.
     pub signature: Signature,
     /// The Id of the signer.
-    pub id: Public,
+    pub id: EdPublic,
 }
-#[derive(Clone, Debug, Decode)]
+#[derive(Clone, Debug, Decode, Deserialize)]
 pub struct Commit {
     pub target_hash: H256,
     /// The target block's number.
@@ -69,15 +58,19 @@ pub struct GrandpaJustification {
     pub votes_ancestries: Vec<Header>,
 }
 
-#[derive(Debug, Decode)]
-pub struct Authority(Public, u64);
-
-#[derive(Deserialize, Debug)]
-struct AuthorityResponse {
-    jsonrpc: String,
-    result: String,
-    id: i32,
+impl<'de> Deserialize<'de> for GrandpaJustification {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = bytes::deserialize(deserializer)?;
+        Self::decode(&mut &encoded[..])
+            .map_err(|codec_err| D::Error::custom(format!("Invalid decoding: {:?}", codec_err)))
+    }
 }
+
+#[derive(Debug, Decode)]
+pub struct Authority(EdPublic, u64);
 
 #[derive(Debug, Encode)]
 pub enum SignerMessage {
@@ -108,147 +101,54 @@ pub async fn main() {
         }
     });
 
-    //Subscribe to justifications
-    let (a, b) = connect_async(url).await.unwrap();
-    let (mut write, mut read) = a.split();
-    let payload = format!(
-        r#"{{"id": 1, "jsonrpc": "2.0", "method": "grandpa_subscribeJustifications", "params": []}}"#,
-    );
+    let t = c.rpc().deref();
+    let sub: Result<subxt::rpc::Subscription<GrandpaJustification>, subxt::Error> = t
+        .subscribe(
+            "grandpa_subscribeJustifications",
+            RpcParams::new(),
+            "grandpa_unsubscribeJustifications",
+        )
+        .await;
 
-    write.send(Message::Text(payload)).await.unwrap();
-
-    let msg = read.next().await.unwrap().unwrap();
-
-    let sub_resp: SubscriptionResponse =
-        serde_json::from_slice(msg.into_data().as_slice()).unwrap();
-
-    println!("Subscribe response: {sub_resp:?}");
-
-    // receive stream of justifications
-
-    while let Some(message) = read.next().await {
-        // println!("msg:{:?}", message);
-        let raw_just = message.unwrap().into_data();
-        let resp: SubscriptionMessage = serde_json::from_slice(raw_just.as_slice()).unwrap();
-        // println!("Grandpa Justifications: {resp:?}");
-        // let j: GrandpaJustification = Decode::decode(&mut &raw_just[..]).unwrap();
-        // println!("Just: {:?}", j);
-        let raw = sp_core::bytes::from_hex(resp.params.result.as_str()).unwrap();
-        let input = &mut &raw[..];
-        let j: GrandpaJustification = Decode::decode(input).unwrap();
-        assert!(input.len() == 0);
-        println!("GRANDPA Justifications: {:?}", j);
-
-        let request_header = format!(
-            r#"{{"id": 2, "jsonrpc": "2.0", "method": "chain_getHeader", "params": ["{:?}"]}}"#,
-            j.commit.target_hash
-        );
-        // println!("msg:{request_header}");
-        write.send(Message::Text(request_header)).await.unwrap();
-        let msg = read.next().await.unwrap().unwrap();
-        // println!("Raw message: {msg:?}");
-
-        let m: HeaderResponse = serde_json::from_slice(msg.into_data().as_slice()).unwrap();
-        // println!("Header:{:?}", m.result);
-
-        let header = m.result;
-        let calculated_hash: H256 = Encode::using_encoded(&header, |e| blake2_256(e)).into();
-        assert_eq!(j.commit.target_hash, calculated_hash);
-
-        // Get current authorities set ID
-        let key = format!(
-            "0x{}{}",
-            hex::encode(twox_128("Grandpa".as_bytes())),
-            hex::encode(twox_128("CurrentSetId".as_bytes()))
-        );
-        // println!("key: {key}");
-        let request_auths = format!(
-            r#"{{"id": 3, "jsonrpc": "2.0", "method": "state_getStorage", "params": ["{key}"]}}"#,
-        );
-        write.send(Message::Text(request_auths)).await.unwrap();
-        let msg = read.next().await.unwrap().unwrap();
-        // println!("Raw message: {msg:?}");
-
-        let resp: AuthorityResponse = serde_json::from_slice(msg.into_data().as_slice()).unwrap();
-        // println!("resp:{}", resp.result);
-        let resp_from_hex = sp_core::bytes::from_hex(resp.result.as_str()).unwrap();
-        let set_id: u64 = Decode::decode(&mut resp_from_hex.as_slice()).unwrap();
-        println!("SetId={set_id}");
-
-        // Get authorities 2
-        let key = format!(
-            "0x{}{}",
-            hex::encode(twox_128("AuthorityDiscovery".as_bytes())),
-            hex::encode(twox_128("Keys".as_bytes()))
-        );
-        println!("key: {key}");
-        let request_auths = format!(
-            r#"{{"id": 3, "jsonrpc": "2.0", "method": "state_getStorage", "params": ["{key}"]}}"#,
-        );
-        write.send(Message::Text(request_auths)).await.unwrap();
-        let msg = read.next().await.unwrap().unwrap();
-        // println!("Raw message: {msg:?}");
-        let resp: AuthorityResponse = serde_json::from_slice(msg.into_data().as_slice()).unwrap();
-        let from_hex = sp_core::bytes::from_hex(resp.result.as_str()).unwrap();
-        let input = &mut from_hex.as_slice();
-        let auths: Vec<Public> = Decode::decode(input).unwrap();
-        assert!(input.len() == 0);
-        println!("Authority discovery: {auths:?}");
-
-        // Get authorities 1
-        let key = format!(
-            "0x{}{}",
-            hex::encode(twox_128("Babe".as_bytes())),
-            hex::encode(twox_128("Authorities".as_bytes()))
-        );
-        println!("key: {key}");
-        let request_auths = format!(
-            r#"{{"id": 3, "jsonrpc": "2.0", "method": "state_getStorage", "params": ["{key}"]}}"#,
-        );
-        write.send(Message::Text(request_auths)).await.unwrap();
-        let msg = read.next().await.unwrap().unwrap();
-        // println!("Raw message: {msg:?}");
-        let resp: AuthorityResponse = serde_json::from_slice(msg.into_data().as_slice()).unwrap();
-        let from_hex = sp_core::bytes::from_hex(resp.result.as_str()).unwrap();
-        let input = &mut from_hex.as_slice();
-        let auths: Vec<Authority> = Decode::decode(input).unwrap();
-        assert!(input.len() == 0);
-        println!("Babe authorities:{auths:?}");
-
-        // Get nextauthorities
-        let key = format!(
-            "0x{}{}",
-            hex::encode(twox_128("Babe".as_bytes())),
-            hex::encode(twox_128("NextAuthorities".as_bytes()))
-        );
-        println!("key: {key}");
-        let request_auths = format!(
-            r#"{{"id": 3, "jsonrpc": "2.0", "method": "state_getStorage", "params": ["{key}"]}}"#,
-        );
-        write.send(Message::Text(request_auths)).await.unwrap();
-        let msg = read.next().await.unwrap().unwrap();
-        // println!("Raw message: {msg:?}");
-        let resp: AuthorityResponse = serde_json::from_slice(msg.into_data().as_slice()).unwrap();
-        let from_hex = sp_core::bytes::from_hex(resp.result.as_str()).unwrap();
-        let input = &mut from_hex.as_slice();
-        let auths: Vec<Authority> = Decode::decode(input).unwrap();
-        assert!(input.len() == 0);
-        println!("Babe authorities:{auths:?}");
+    let mut sub = sub.unwrap();
+    while let Some(Ok(justification)) = sub.next().await {
+        println!("Justification: {justification:?}");
+        let header = c
+            .rpc()
+            .header(Some(justification.commit.target_hash))
+            .await
+            .unwrap()
+            .unwrap();
+        let calculated_hash: H256 = Encode::using_encoded(&header, blake2_256).into();
+        assert_eq!(justification.commit.target_hash, calculated_hash);
+        let set_id_key = api::storage().grandpa().current_set_id();
+        let set_id = c.storage().fetch(&set_id_key, None).await.unwrap().unwrap();
+        println!("Current set id: {set_id:?}");
 
         let signed_message = Encode::encode(&(
-            &SignerMessage::PrecommitMessage(j.commit.precommits[0].clone().precommit),
-            &j.round,
+            &SignerMessage::PrecommitMessage(justification.commit.precommits[0].clone().precommit),
+            &justification.round,
             &set_id,
         ));
         // let p: ed25519::Public = auths[0].0;
-        let p = j.commit.precommits[0].clone().id;
+        let p: EdPublic = justification.commit.precommits[0].clone().id;
         let is_ok = <ed25519::Pair as Pair>::verify_weak(
-            &j.commit.precommits[0].clone().signature.0[..],
+            &justification.commit.precommits[0].clone().signature.0[..],
             signed_message.as_slice(),
             p,
         );
         assert!(is_ok, "Not signed by this signature!");
+        let p = p.0;
+        println!("Justification AccountId: {p:?}");
 
-        println!("#####")
+        let authority_set_key = api::storage().authority_discovery().keys();
+        let authority_set = c
+            .storage()
+            .fetch(&authority_set_key, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let a: SrPublic = authority_set.0[0].clone().0;
+        println!("Current authority set: {a:?}");
     }
 }

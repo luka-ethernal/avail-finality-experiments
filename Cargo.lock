@@ -1379,6 +1379,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sp-core",
+ "subxt",
  "tokio",
  "tokio-tungstenite",
 ]
