@@ -1,11 +1,14 @@
+use std::borrow::Borrow;
 use std::ops::Deref;
 
+use avail_subxt::api::runtime_types::sp_core::crypto::KeyTypeId;
 use avail_subxt::api::runtime_types::sp_core::sr25519::Public as SrPublic;
 use avail_subxt::{api, build_client, primitives::Header};
 use codec::{Decode, Encode};
 use futures_util::StreamExt;
 use serde::de::Error;
 use serde::Deserialize;
+use sp_core::crypto::key_types;
 use sp_core::{
     blake2_256, bytes,
     crypto::Pair,
@@ -157,8 +160,31 @@ pub async fn main() {
             .await
             .unwrap()
             .unwrap();
-        let a: Vec<SrPublic> = authority_set.0.into_iter().map(|e|e.0).collect();
+        let a: Vec<SrPublic> = authority_set.0.into_iter().map(|e| e.0).collect();
         println!("Current authority set: {a:?}");
         // Authority set is sr25519 key, justification is ed25519.
+        let session_key_key_owner = api::storage()
+            .session()
+            .key_owner(KeyTypeId(sp_core::crypto::key_types::GRANDPA.0), p.0);
+        let key_owner_p = c
+            .storage()
+            .fetch(&session_key_key_owner, None)
+            .await
+            .unwrap()
+            .unwrap();
+        println!("Owner p: {key_owner_p:?}");
+        let session_key_key_owner = api::storage().session().key_owner(
+            KeyTypeId(sp_core::crypto::key_types::AUTHORITY_DISCOVERY.0),
+            a[0].0,
+        );
+        let key_owner_a = c
+            .storage()
+            .fetch(&session_key_key_owner, None)
+            .await
+            .unwrap()
+            .unwrap();
+        println!("Owner a: {key_owner_a:?}");
+
+        assert_eq!(key_owner_a, key_owner_p, "Validator doesn't match");
     }
 }
