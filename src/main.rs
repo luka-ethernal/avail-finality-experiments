@@ -119,17 +119,17 @@ pub async fn main() {
     while let Some(Ok(justification)) = sub.next().await {
         println!("Justification: {justification:?}");
 
-        // get the header corresponding to the new justification
+        // Get the header corresponding to the new justification
         let header = c
             .rpc()
             .header(Some(justification.commit.target_hash))
             .await
             .unwrap()
             .unwrap();
-        // a bit redundant, but just to make sure the hash is correct
+        // A bit redundant, but just to make sure the hash is correct
         let calculated_hash: H256 = Encode::using_encoded(&header, blake2_256).into();
         assert_eq!(justification.commit.target_hash, calculated_hash);
-        // get current authority set ID
+        // Get current authority set ID
         let set_id_key = api::storage().grandpa().current_set_id();
         let set_id = c.storage().fetch(&set_id_key, None).await.unwrap().unwrap();
         println!("Current set id: {set_id:?}");
@@ -166,13 +166,17 @@ pub async fn main() {
         let session_key_key_owner = api::storage()
             .session()
             .key_owner(KeyTypeId(sp_core::crypto::key_types::GRANDPA.0), p.0);
+
+        // Query the owner of the signature key.
         let key_owner_p = c
             .storage()
             .fetch(&session_key_key_owner, None)
             .await
             .unwrap()
             .unwrap();
-        println!("Owner p: {key_owner_p:?}");
+        println!("Owner signature: {key_owner_p:?}");
+
+        // Query the owner of the authority key.
         let session_key_key_owner = api::storage().session().key_owner(
             KeyTypeId(sp_core::crypto::key_types::AUTHORITY_DISCOVERY.0),
             a[0].0,
@@ -183,7 +187,7 @@ pub async fn main() {
             .await
             .unwrap()
             .unwrap();
-        println!("Owner a: {key_owner_a:?}");
+        println!("Owner authority: {key_owner_a:?}");
 
         assert_eq!(key_owner_a, key_owner_p, "Validator doesn't match");
     }
