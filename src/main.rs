@@ -1,15 +1,12 @@
-use std::borrow::Borrow;
 use std::ops::Deref;
 
 use avail_subxt::api::runtime_types::sp_core::crypto::KeyTypeId;
-use avail_subxt::api::runtime_types::sp_core::sr25519::Public as SrPublic;
 use avail_subxt::{api, build_client, primitives::Header};
 use codec::{Decode, Encode};
-use futures_util::future::{self, join_all};
-use futures_util::{StreamExt, TryFutureExt};
+use futures_util::future::join_all;
+use futures_util::StreamExt;
 use serde::de::Error;
 use serde::Deserialize;
-use sp_core::crypto::key_types;
 use sp_core::{
     blake2_256, bytes,
     crypto::Pair,
