@@ -1372,6 +1372,7 @@ dependencies = [
 name = "justify"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "avail-subxt",
  "futures-util",
  "hex",

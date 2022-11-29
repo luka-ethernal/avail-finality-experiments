@@ -5,7 +5,8 @@ use avail_subxt::api::runtime_types::sp_core::crypto::KeyTypeId;
 use avail_subxt::api::runtime_types::sp_core::sr25519::Public as SrPublic;
 use avail_subxt::{api, build_client, primitives::Header};
 use codec::{Decode, Encode};
-use futures_util::StreamExt;
+use futures_util::future::{self, join_all};
+use futures_util::{StreamExt, TryFutureExt};
 use serde::de::Error;
 use serde::Deserialize;
 use sp_core::crypto::key_types;
@@ -16,6 +17,7 @@ use sp_core::{
     H256,
 };
 use subxt::rpc::RpcParams;
+// use anyhow::Result;
 
 #[derive(Deserialize, Debug)]
 pub struct SubscriptionMessageResult {
@@ -83,7 +85,7 @@ pub enum SignerMessage {
 
 #[tokio::main]
 pub async fn main() {
-    let url = "ws://localhost:9944";
+    let url = "wss://devnet06.dataavailability.link:28546";
 
     let c = build_client(url).await.unwrap();
     let mut e = c.events().subscribe().await.unwrap().filter_events::<(
@@ -140,55 +142,71 @@ pub async fn main() {
             &justification.round,
             &set_id,
         ));
-        // Extract the public key of the signed message
-        let p: EdPublic = justification.commit.precommits[0].clone().id;
 
-        // Verify signature
-        let is_ok = <ed25519::Pair as Pair>::verify_weak(
-            &justification.commit.precommits[0].clone().signature.0[..],
-            signed_message.as_slice(),
-            p,
-        );
-        assert!(is_ok, "Not signed by this signature!");
-        println!("Justification AccountId: {p:?}");
+        // Verify all the signatures of the justification and extract the public keys
+        let sig_owners_fut = justification
+            .commit
+            .precommits
+            .iter()
+            .map(|precommit| async {
+                let is_ok = <ed25519::Pair as Pair>::verify_weak(
+                    &precommit.clone().signature.0[..],
+                    signed_message.as_slice(),
+                    &precommit.clone().id,
+                );
+                assert!(is_ok, "Not signed by this signature!");
+                // println!("Justification AccountId: {p:?}");
+                let session_key_key_owner = api::storage().session().key_owner(
+                    KeyTypeId(sp_core::crypto::key_types::GRANDPA.0),
+                    precommit.clone().id.0,
+                );
+                c.storage().fetch(&session_key_key_owner, None).await
+            })
+            .collect::<Vec<_>>();
+        let sig_owners = join_all(sig_owners_fut)
+            .await
+            .into_iter()
+            .map(|e| e.unwrap().unwrap())
+            .collect::<Vec<_>>();
+        println!("Sig owners: {sig_owners:?}");
 
-        // Get the current authority set
-        let authority_set_key = api::storage().authority_discovery().keys();
+        // Get the current authority set and extract all owner accounts and weights
+        let authority_set_key = api::storage().babe().authorities();
         let authority_set = c
             .storage()
             .fetch(&authority_set_key, None)
             .await
             .unwrap()
             .unwrap();
-        let a: Vec<SrPublic> = authority_set.0.into_iter().map(|e| e.0).collect();
-        println!("Current authority set: {a:?}");
-        // Authority set is sr25519 key, justification is ed25519.
-        let session_key_key_owner = api::storage()
-            .session()
-            .key_owner(KeyTypeId(sp_core::crypto::key_types::GRANDPA.0), p.0);
+        let auth_set_fut = authority_set.0.iter().map(|e| async {
+            let (public_key, weight) = e.clone();
+            let pk = public_key.0 .0;
+            let session_key_key_owner = api::storage()
+                .session()
+                .key_owner(KeyTypeId(sp_core::crypto::key_types::BABE.0), pk);
+            let f = c.storage().fetch(&session_key_key_owner, None).await;
+            (f.unwrap().unwrap(), weight)
+        });
 
-        // Query the owner of the signature key.
-        let key_owner_p = c
-            .storage()
-            .fetch(&session_key_key_owner, None)
-            .await
-            .unwrap()
-            .unwrap();
-        println!("Owner signature: {key_owner_p:?}");
+        let auth_owners = join_all(auth_set_fut).await;
+        println!("Current authority set: {auth_owners:?}");
 
-        // Query the owner of the authority key.
-        let session_key_key_owner = api::storage().session().key_owner(
-            KeyTypeId(sp_core::crypto::key_types::AUTHORITY_DISCOVERY.0),
-            a[0].0,
-        );
-        let key_owner_a = c
-            .storage()
-            .fetch(&session_key_key_owner, None)
-            .await
-            .unwrap()
-            .unwrap();
-        println!("Owner authority: {key_owner_a:?}");
+        // Calculate the total weight of the authority set
+        let total_weight: u64 = auth_owners.iter().map(|e| e.1).sum();
 
-        assert_eq!(key_owner_a, key_owner_p, "Validator doesn't match");
+        // Crosscheck all the weight and calculate how much was in the concensus
+        let weight: u64 = sig_owners
+            .iter()
+            .map(|e| {
+                auth_owners
+                    .iter()
+                    .find(|e1| e1.0.eq(e))
+                    .map(|e| e.1)
+                    .unwrap_or(0)
+            })
+            .sum();
+        println!("Total auth weight: {total_weight}");
+        println!("Total weight signed: {weight}");
+        assert!(weight as f64 >= ((total_weight as f64) * 2. / 3.));
     }
 }

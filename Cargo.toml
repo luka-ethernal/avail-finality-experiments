@@ -17,3 +17,4 @@ sp-core = "6.0.0"
 avail-subxt = {path = "../avail/avail-subxt"}
 subxt = "0.24"
 hex = "0.4.3"
+anyhow = "1.0.66"
