@@ -14,6 +14,6 @@ serde = {version = "1", features= ["derive"]}
 # sc-finality-grandpa = {git = "https://github.com/paritytech/substrate.git"}
 codec = { package = "parity-scale-codec", version = "3.0.0", default-features = false, features = ["derive", "full", "bit-vec"] }
 sp-core = "6.0.0"
-avail-subxt = {path = "../avail/avail-subxt"}
+avail-subxt = {git = "https://github.com/maticnetwork/avail.git"}
 subxt = "0.24"
 hex = "0.4.3"

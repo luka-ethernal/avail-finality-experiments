@@ -138,6 +138,7 @@ checksum = "d468802bab17cbc0cc575e9b053f41e72aa36bfa6b7f55e3529ffa43161b97fa"
 [[package]]
 name = "avail-subxt"
 version = "0.1.0"
+source = "git+https://github.com/maticnetwork/avail.git#044b982adcbedd1e2c85ea2cb4ae81fff4a34f94"
 dependencies = [
  "anyhow",
  "derive_more",
