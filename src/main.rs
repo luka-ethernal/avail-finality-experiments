@@ -244,7 +244,8 @@ async fn main() {
                 println!(
                     "Number of matching signatures: {num}/{}",
                     validator_set.len()
-                )
+                );
+                assert!(num >= (validator_set.len() * 2 / 3), "Not signed by supermajority.");
             } else {
                 eprintln!("No match!");
             }
