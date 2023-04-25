@@ -1,10 +1,9 @@
 use avail_subxt::{
-    api::{self, runtime_types::sp_core::crypto::KeyTypeId},
+    api::{self},
     build_client,
     primitives::Header,
 };
 use codec::{Decode, Encode};
-use futures_util::future::join_all;
 use serde::de::Error;
 use serde::Deserialize;
 use sp_core::{
@@ -67,33 +66,44 @@ impl<'de> Deserialize<'de> for GrandpaJustification {
 pub enum Messages {
     Justification(GrandpaJustification),
     ValidatorSetChange((Vec<EdPublic>, u64)),
-    UncheckedHeader(Header),
+    NewHeader(Header),
 }
 
 #[tokio::main]
 async fn main() {
     let url = "ws://localhost:9944";
-    let c = build_client(url, true).await.unwrap();
-    let mut a = c.rpc().subscribe_finalized_block_headers().await.unwrap();
+    let subxt_client = build_client(url, true).await.unwrap();
+    let mut header_subscription = subxt_client
+        .rpc()
+        .subscribe_finalized_block_headers()
+        .await
+        .unwrap();
 
-    // current set of authorities, implicitly trusted
-    let validators_key = api::storage().session().validators();
-    let mut validator_set: Vec<EdPublic> = c
-        .storage()
+    // current set of authorities, implicitly trusted, fetched from grandpa runtime.
+    let grandpa_valset_raw = subxt_client
+        .runtime_api()
         .at(None)
         .await
         .unwrap()
-        .fetch(&validators_key)
+        .call_raw("GrandpaApi_grandpa_authorities", None)
         .await
-        .unwrap()
-        .unwrap()
-        .iter()
-        .map(|e| EdPublic::from_raw(e.0))
-        .collect();
+        .unwrap();
 
+    // Decode result to proper type - ed25519 public key and u64 weight.
+    let grandpa_valset: Vec<(EdPublic, u64)> =
+        Decode::decode(&mut &grandpa_valset_raw[..]).unwrap();
+
+    // Drop weights, as they are not currently used.
+    let mut validator_set: Vec<EdPublic> = grandpa_valset.iter().map(|e| e.0).collect();
+
+    // Set ID is acquired in a separate storage query. It is necessary, because it is a part of message being signed.
+
+    // Form a query key for storage
     let set_id_key = api::storage().grandpa().current_set_id();
-    let mut set_id = c
+    // Fetch the set ID from storage at current height
+    let mut set_id = subxt_client
         .storage()
+        // None means current height
         .at(None)
         .await
         .unwrap()
@@ -102,54 +112,55 @@ async fn main() {
         .unwrap()
         .unwrap();
 
-    println!(
-        "Current set: {:?}",
-        validator_set
-            .iter()
-            .map(|e| EdPublic::from_raw(e.0))
-            .collect::<Vec<_>>()
-    );
+    println!("Current set: {:?}", validator_set);
 
+    // Forming a channel for sending any relevant events gathered asynchronously through Substrate WS API.
     let (msg_sender, mut msg_receiver) = unbounded_channel::<Messages>();
 
-    // Produces headers and new validator sets
+    // Task that produces headers and new validator sets
     tokio::spawn({
-        let c = c.clone();
+        let subxt_client = subxt_client.clone();
         let msg_sender = msg_sender.clone();
         async move {
-            while let Some(Ok(header)) = a.next().await {
+            while let Some(Ok(header)) = header_subscription.next().await {
                 let head_hash: H256 = Encode::using_encoded(&header, blake2_256).into();
-                msg_sender.send(Messages::UncheckedHeader(header)).unwrap();
-                let events = c.events().at(Some(head_hash)).await.unwrap();
+                msg_sender.send(Messages::NewHeader(header)).unwrap();
+                // Fetch all events at the incoming header hight.
+                let events = subxt_client.events().at(Some(head_hash)).await.unwrap();
 
+                // Filter out just new authorities event.
                 let new_auths =
                     events.find_last::<avail_subxt::api::grandpa::events::NewAuthorities>();
 
-                let set_id = c
-                    .storage()
-                    .at(Some(head_hash))
-                    .await
-                    .unwrap()
-                    .fetch(&set_id_key)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                // If the event exists, send the new auths over the message channel.
                 if let Ok(Some(auths)) = new_auths {
-                    let v: Vec<EdPublic> = auths
+                    // Fetch set ID at the incoming header hight (needed to verify justification).
+                    let set_id = subxt_client
+                        .storage()
+                        .at(Some(head_hash))
+                        .await
+                        .unwrap()
+                        .fetch(&set_id_key)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // Drop weights and re-pack into appropriate type.
+                    let new_valset: Vec<EdPublic> = auths
                         .authority_set
                         .into_iter()
                         .map(|(a, _)| EdPublic::from_raw(a.0 .0))
                         .collect();
-                    println!("New set: {v:?}!");
+                    // Send it.
                     msg_sender
-                        .send(Messages::ValidatorSetChange((v, set_id)))
+                        .send(Messages::ValidatorSetChange((new_valset, set_id)))
                         .unwrap();
                 }
             }
         }
     });
 
-    let j: Result<subxt::rpc::Subscription<GrandpaJustification>, subxt::Error> = c
+    // Subscribe to justifications.
+    let j: Result<subxt::rpc::Subscription<GrandpaJustification>, subxt::Error> = subxt_client
         .rpc()
         .subscribe(
             "grandpa_subscribeJustifications",
@@ -157,97 +168,96 @@ async fn main() {
             "grandpa_unsubscribeJustifications",
         )
         .await;
-    let mut j = j.unwrap();
+    let mut justification_subscription = j.unwrap();
 
-    // Produces justifications
+    // Task that produces justifications concurrently and just passes the justification to the main task.
     tokio::spawn(async move {
-        while let Some(Ok(just)) = j.next().await {
-            msg_sender.send(Messages::Justification(just)).unwrap();
+        while let Some(Ok(justification)) = justification_subscription.next().await {
+            msg_sender
+                .send(Messages::Justification(justification))
+                .unwrap();
         }
     });
 
-    let mut unchecked_headers: Vec<Header> = vec![];
+    // An accumulated collection of unverified headers and justifications that are matched one by one as headers/justifications arrive.
+    let mut unverified_headers: Vec<Header> = vec![];
     let mut justifications: Vec<GrandpaJustification> = vec![];
-    // Gathers blocks, justifications and validator sets and checks finality
+
+    // Main loop, gathers blocks, justifications and validator sets and checks finality
     loop {
         match msg_receiver.recv().await.unwrap() {
             Messages::Justification(justification) => {
                 println!(
-                    "New just on block: {}, hash: {:?}",
+                    "New justification at block no.: {}, hash: {:?}",
                     justification.commit.target_number, justification.commit.target_hash
                 );
                 justifications.push(justification);
             }
             Messages::ValidatorSetChange(valset) => {
-                println!("New valset: {valset:?}");
+                println!("######################");
+                println!("New validator set: {valset:?}");
+                println!("######################");
                 (validator_set, set_id) = valset;
             }
-            Messages::UncheckedHeader(header) => {
+            Messages::NewHeader(header) => {
                 let hash: H256 = Encode::using_encoded(&header, blake2_256).into();
-                println!("Header num={}, hash: {hash:?}", header.number);
-                unchecked_headers.push(header);
+                println!("Header no.: {}, hash: {hash:?}", header.number);
+                unverified_headers.push(header);
             }
         }
 
-        while let Some(h) = unchecked_headers.pop() {
-            let hash = Encode::using_encoded(&h, blake2_256).into();
+        while let Some(header) = unverified_headers.pop() {
+            let hash = Encode::using_encoded(&header, blake2_256).into();
 
+            // Iterate through justifications and try to find a matching one.
             if let Some(pos) = justifications
                 .iter()
                 .position(|e| e.commit.target_hash == hash)
             {
-                let just = justifications.swap_remove(pos);
-                // Form a message which is signed in the justification
+                // Basically, pop it out of the collection.
+                let justification = justifications.swap_remove(pos);
+                // Form a message which is signed in the justification, it's a triplet of a Precommit, round number and set_id (taken from Substrate code).
                 let signed_message = Encode::encode(&(
-                    &SignerMessage::PrecommitMessage(just.commit.precommits[0].clone().precommit),
-                    &just.round,
-                    &set_id,
+                    &SignerMessage::PrecommitMessage(justification.commit.precommits[0].clone().precommit),
+                    &justification.round,
+                    &set_id, // Set ID is needed here.
                 ));
 
-                // Verify all the signatures of the justification signs the hash of the block
-                let sigs = just
+                // Verify all the signatures of the justification signs the hash of the block and extract all the signer addreses.
+                let signer_addresses = justification
                     .commit
                     .precommits
                     .iter()
-                    .map(|precommit| async {
+                    .map(|precommit| {
                         let is_ok = <ed25519::Pair as Pair>::verify_weak(
                             &precommit.clone().signature.0[..],
                             signed_message.as_slice(),
-                            &precommit.clone().id,
+                            precommit.clone().id,
                         );
+                        // On first failure to verify signature, we exit.
                         assert!(is_ok, "Not signed by this signature!");
-                        let id = precommit.clone().id.0;
-                        let session_key_key_owner = api::storage()
-                            .session()
-                            .key_owner(KeyTypeId(sp_core::crypto::key_types::GRANDPA.0), id);
-                        c.storage()
-                            .at(Some(precommit.precommit.target_hash))
-                            .await
-                            .unwrap()
-                            .fetch(&session_key_key_owner)
-                            .await
+                        precommit.clone().id
                     })
                     .collect::<Vec<_>>();
-                let sig_owners = join_all(sigs)
-                    .await
-                    .into_iter()
-                    .map(|e| e.unwrap().unwrap())
-                    .collect::<Vec<_>>();
-                // Match all the signatures to the current validator set.
-                let num = sig_owners.iter().fold(0usize, |acc, x| {
-                    if validator_set.iter().find(|e| e.0.eq(&x.0)).is_some() {
+
+                // Match all the signer addresses to the current validator set.
+                let num_matched_addresses = signer_addresses.iter().fold(0usize, |acc, x| {
+                    if validator_set.iter().any(|e| e.0.eq(&x.0)) {
                         acc + 1
                     } else {
                         acc
                     }
                 });
                 println!(
-                    "Number of matching signatures: {num}/{}",
+                    "Number of matching signatures: {num_matched_addresses}/{}",
                     validator_set.len()
                 );
-                assert!(num >= (validator_set.len() * 2 / 3), "Not signed by supermajority.");
+                assert!(
+                    num_matched_addresses >= (validator_set.len() * 2 / 3),
+                    "Not signed by the supermajority of the validator set."
+                );
             } else {
-                eprintln!("No match!");
+                eprintln!("Matched pair of header/justification not found.");
             }
         }
     }
