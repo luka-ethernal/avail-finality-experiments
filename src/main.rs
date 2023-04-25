@@ -1,32 +1,24 @@
-use std::ops::Deref;
-
-use avail_subxt::api::runtime_types::sp_core::crypto::KeyTypeId;
-use avail_subxt::{api, build_client, primitives::Header};
+use avail_subxt::{
+    api::{self, runtime_types::sp_core::crypto::KeyTypeId},
+    build_client,
+    primitives::Header,
+};
 use codec::{Decode, Encode};
 use futures_util::future::join_all;
-use futures_util::StreamExt;
 use serde::de::Error;
 use serde::Deserialize;
 use sp_core::{
     blake2_256, bytes,
-    crypto::Pair,
     ed25519::{self, Public as EdPublic, Signature},
-    H256,
+    Pair, H256,
 };
-use subxt::rpc::RpcParams;
-// use anyhow::Result;
+use subxt::rpc_params;
+use tokio::sync::mpsc::unbounded_channel;
 
-#[derive(Deserialize, Debug)]
-pub struct SubscriptionMessageResult {
-    pub result: String,
-    pub subscription: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct SubscriptionMessage {
-    pub jsonrpc: String,
-    pub params: SubscriptionMessageResult,
-    pub method: String,
+#[derive(Debug, Encode)]
+pub enum SignerMessage {
+    DummyMessage(u32),
+    PrecommitMessage(Precommit),
 }
 
 #[derive(Clone, Debug, Decode, Encode, Deserialize)]
@@ -71,139 +63,191 @@ impl<'de> Deserialize<'de> for GrandpaJustification {
     }
 }
 
-#[derive(Debug, Decode)]
-pub struct Authority(EdPublic, u64);
-
-#[derive(Debug, Encode)]
-pub enum SignerMessage {
-    DummyMessage(u32),
-    PrecommitMessage(Precommit),
+#[derive(Clone, Debug, Decode)]
+pub enum Messages {
+    Justification(GrandpaJustification),
+    ValidatorSetChange((Vec<EdPublic>, u64)),
+    UncheckedHeader(Header),
 }
 
 #[tokio::main]
-pub async fn main() {
-    let url = "wss://devnet06.dataavailability.link:28546";
+async fn main() {
+    let url = "ws://localhost:9944";
+    let c = build_client(url, true).await.unwrap();
+    let mut a = c.rpc().subscribe_finalized_block_headers().await.unwrap();
 
-    let c = build_client(url).await.unwrap();
-    let mut e = c.events().subscribe().await.unwrap().filter_events::<(
-        api::grandpa::events::NewAuthorities,
-        api::grandpa::events::Paused,
-        api::grandpa::events::Resumed,
-    )>();
+    // current set of authorities, implicitly trusted
+    let validators_key = api::storage().session().validators();
+    let mut validator_set: Vec<EdPublic> = c
+        .storage()
+        .at(None)
+        .await
+        .unwrap()
+        .fetch(&validators_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|e| EdPublic::from_raw(e.0))
+        .collect();
 
-    tokio::spawn(async move {
-        while let Some(ev) = e.next().await {
-            let event_details = ev.unwrap();
-            match event_details.event {
-                (Some(new_auths), None, None) => println!("New auths: {new_auths:?}"),
-                (None, Some(paused), None) => println!("Auth set paused: {paused:?}"),
-                (None, None, Some(resumed)) => println!("Auth set resumed: {resumed:?}"),
-                _ => unreachable!(),
+    let set_id_key = api::storage().grandpa().current_set_id();
+    let mut set_id = c
+        .storage()
+        .at(None)
+        .await
+        .unwrap()
+        .fetch(&set_id_key)
+        .await
+        .unwrap()
+        .unwrap();
+
+    println!(
+        "Current set: {:?}",
+        validator_set
+            .iter()
+            .map(|e| EdPublic::from_raw(e.0))
+            .collect::<Vec<_>>()
+    );
+
+    let (msg_sender, mut msg_receiver) = unbounded_channel::<Messages>();
+
+    // Produces headers and new validator sets
+    tokio::spawn({
+        let c = c.clone();
+        let msg_sender = msg_sender.clone();
+        async move {
+            while let Some(Ok(header)) = a.next().await {
+                let head_hash: H256 = Encode::using_encoded(&header, blake2_256).into();
+                msg_sender.send(Messages::UncheckedHeader(header)).unwrap();
+                let events = c.events().at(Some(head_hash)).await.unwrap();
+
+                let new_auths =
+                    events.find_last::<avail_subxt::api::grandpa::events::NewAuthorities>();
+
+                let set_id = c
+                    .storage()
+                    .at(Some(head_hash))
+                    .await
+                    .unwrap()
+                    .fetch(&set_id_key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let Ok(Some(auths)) = new_auths {
+                    let v: Vec<EdPublic> = auths
+                        .authority_set
+                        .into_iter()
+                        .map(|(a, _)| EdPublic::from_raw(a.0 .0))
+                        .collect();
+                    println!("New set: {v:?}!");
+                    msg_sender
+                        .send(Messages::ValidatorSetChange((v, set_id)))
+                        .unwrap();
+                }
             }
         }
     });
 
-    let t = c.rpc().deref();
-    let sub: Result<subxt::rpc::Subscription<GrandpaJustification>, subxt::Error> = t
+    let j: Result<subxt::rpc::Subscription<GrandpaJustification>, subxt::Error> = c
+        .rpc()
         .subscribe(
             "grandpa_subscribeJustifications",
-            RpcParams::new(),
+            rpc_params![],
             "grandpa_unsubscribeJustifications",
         )
         .await;
+    let mut j = j.unwrap();
 
-    let mut sub = sub.unwrap();
+    // Produces justifications
+    tokio::spawn(async move {
+        while let Some(Ok(just)) = j.next().await {
+            msg_sender.send(Messages::Justification(just)).unwrap();
+        }
+    });
 
-    // Wait for new justification
-    while let Some(Ok(justification)) = sub.next().await {
-        println!("Justification: {justification:?}");
-
-        // Get the header corresponding to the new justification
-        let header = c
-            .rpc()
-            .header(Some(justification.commit.target_hash))
-            .await
-            .unwrap()
-            .unwrap();
-        // A bit redundant, but just to make sure the hash is correct
-        let calculated_hash: H256 = Encode::using_encoded(&header, blake2_256).into();
-        assert_eq!(justification.commit.target_hash, calculated_hash);
-        // Get current authority set ID
-        let set_id_key = api::storage().grandpa().current_set_id();
-        let set_id = c.storage().fetch(&set_id_key, None).await.unwrap().unwrap();
-        println!("Current set id: {set_id:?}");
-
-        // Form a message which is signed in the justification
-        let signed_message = Encode::encode(&(
-            &SignerMessage::PrecommitMessage(justification.commit.precommits[0].clone().precommit),
-            &justification.round,
-            &set_id,
-        ));
-
-        // Verify all the signatures of the justification and extract the public keys
-        let sig_owners_fut = justification
-            .commit
-            .precommits
-            .iter()
-            .map(|precommit| async {
-                let is_ok = <ed25519::Pair as Pair>::verify_weak(
-                    &precommit.clone().signature.0[..],
-                    signed_message.as_slice(),
-                    &precommit.clone().id,
+    let mut unchecked_headers: Vec<Header> = vec![];
+    let mut justifications: Vec<GrandpaJustification> = vec![];
+    // Gathers blocks, justifications and validator sets and checks finality
+    loop {
+        match msg_receiver.recv().await.unwrap() {
+            Messages::Justification(justification) => {
+                println!(
+                    "New just on block: {}, hash: {:?}",
+                    justification.commit.target_number, justification.commit.target_hash
                 );
-                assert!(is_ok, "Not signed by this signature!");
-                // println!("Justification AccountId: {p:?}");
-                let session_key_key_owner = api::storage().session().key_owner(
-                    KeyTypeId(sp_core::crypto::key_types::GRANDPA.0),
-                    precommit.clone().id.0,
-                );
-                c.storage().fetch(&session_key_key_owner, None).await
-            })
-            .collect::<Vec<_>>();
-        let sig_owners = join_all(sig_owners_fut)
-            .await
-            .into_iter()
-            .map(|e| e.unwrap().unwrap())
-            .collect::<Vec<_>>();
-        println!("Sig owners: {sig_owners:?}");
+                justifications.push(justification);
+            }
+            Messages::ValidatorSetChange(valset) => {
+                println!("New valset: {valset:?}");
+                (validator_set, set_id) = valset;
+            }
+            Messages::UncheckedHeader(header) => {
+                let hash: H256 = Encode::using_encoded(&header, blake2_256).into();
+                println!("Header num={}, hash: {hash:?}", header.number);
+                unchecked_headers.push(header);
+            }
+        }
 
-        // Get the current authority set and extract all owner accounts and weights
-        let authority_set_key = api::storage().babe().authorities();
-        let authority_set = c
-            .storage()
-            .fetch(&authority_set_key, None)
-            .await
-            .unwrap()
-            .unwrap();
-        let auth_set_fut = authority_set.0.iter().map(|e| async {
-            let (public_key, weight) = e.clone();
-            let pk = public_key.0 .0;
-            let session_key_key_owner = api::storage()
-                .session()
-                .key_owner(KeyTypeId(sp_core::crypto::key_types::BABE.0), pk);
-            let f = c.storage().fetch(&session_key_key_owner, None).await;
-            (f.unwrap().unwrap(), weight)
-        });
+        while let Some(h) = unchecked_headers.pop() {
+            let hash = Encode::using_encoded(&h, blake2_256).into();
 
-        let auth_owners = join_all(auth_set_fut).await;
-        println!("Current authority set: {auth_owners:?}");
+            if let Some(pos) = justifications
+                .iter()
+                .position(|e| e.commit.target_hash == hash)
+            {
+                let just = justifications.swap_remove(pos);
+                // Form a message which is signed in the justification
+                let signed_message = Encode::encode(&(
+                    &SignerMessage::PrecommitMessage(just.commit.precommits[0].clone().precommit),
+                    &just.round,
+                    &set_id,
+                ));
 
-        // Calculate the total weight of the authority set
-        let total_weight: u64 = auth_owners.iter().map(|e| e.1).sum();
-
-        // Crosscheck all the weight and calculate how much was in the concensus
-        let weight: u64 = sig_owners
-            .iter()
-            .map(|e| {
-                auth_owners
+                // Verify all the signatures of the justification signs the hash of the block
+                let sigs = just
+                    .commit
+                    .precommits
                     .iter()
-                    .find(|e1| e1.0.eq(e))
-                    .map(|e| e.1)
-                    .unwrap_or(0)
-            })
-            .sum();
-        println!("Total auth weight: {total_weight}");
-        println!("Total weight signed: {weight}");
-        assert!(weight as f64 >= ((total_weight as f64) * 2. / 3.));
+                    .map(|precommit| async {
+                        let is_ok = <ed25519::Pair as Pair>::verify_weak(
+                            &precommit.clone().signature.0[..],
+                            signed_message.as_slice(),
+                            &precommit.clone().id,
+                        );
+                        assert!(is_ok, "Not signed by this signature!");
+                        let id = precommit.clone().id.0;
+                        let session_key_key_owner = api::storage()
+                            .session()
+                            .key_owner(KeyTypeId(sp_core::crypto::key_types::GRANDPA.0), id);
+                        c.storage()
+                            .at(Some(precommit.precommit.target_hash))
+                            .await
+                            .unwrap()
+                            .fetch(&session_key_key_owner)
+                            .await
+                    })
+                    .collect::<Vec<_>>();
+                let sig_owners = join_all(sigs)
+                    .await
+                    .into_iter()
+                    .map(|e| e.unwrap().unwrap())
+                    .collect::<Vec<_>>();
+                // Match all the signatures to the current validator set.
+                let num = sig_owners.iter().fold(0usize, |acc, x| {
+                    if validator_set.iter().find(|e| e.0.eq(&x.0)).is_some() {
+                        acc + 1
+                    } else {
+                        acc
+                    }
+                });
+                println!(
+                    "Number of matching signatures: {num}/{}",
+                    validator_set.len()
+                )
+            } else {
+                eprintln!("No match!");
+            }
+        }
     }
 }
